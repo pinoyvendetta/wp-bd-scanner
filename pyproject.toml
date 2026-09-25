@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wpbdscanner"
+version = "0.1.0"
+description = "WordPress backdoor and malware scanner for PHP files, archives, and plugin checksums"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+  { name = "pinoyvendetta" }
+]
+dependencies = [
+  "colorama>=0.4.6",
+]
+
+[project.optional-dependencies]
+yara = [
+  "yara-python>=4.5.0",
+]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
