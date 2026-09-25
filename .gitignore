@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.json
+*.csv
+quarantine/
+.wp-quarantine/
+.DS_Store
+.idea/
+.vscode/
+*.quarantined.txt

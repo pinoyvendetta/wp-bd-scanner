@@ -1,0 +1,18 @@
+# Example ignore patterns for wpbdscanner.py
+# Usage: python wpbdscanner.py -d /path/to/wp --ignore ignore.example.txt
+#
+# Lines starting with # are comments.
+# Patterns match as case-insensitive substrings of the full path,
+# or as a filename suffix when written as *.ext
+
+# Custom plugin you maintain and trust
+# /wp-content/plugins/my-custom-plugin/
+
+# Backup trees you already reviewed
+# /wp-content/uploads/backups/
+
+# Known minified vendor copies outside normal lib paths
+# */vendor/legacy-jquery/
+
+# Example suffix ignore
+# *.map
