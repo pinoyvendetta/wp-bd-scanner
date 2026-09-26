@@ -1012,7 +1012,7 @@ def _analyze_file_inner(path, root, _depth=0):
     is_binary = is_probably_binary(data)
     path_str = str(path).replace("\\", "/").lower()
     lib = in_known_lib(path_str)
-    no_ext = (ext == "" and not name_lower.startswith("."))
+    no_ext = (ext == "")
 
     # Fast skip: pure images / pure binary non-PHP with no real PHP payload
     # (archives are handled separately below)
@@ -1256,6 +1256,7 @@ def _analyze_file_inner(path, root, _depth=0):
     # ---------------------------------------------------------------------------
     # A successful selective-decode hit is treated as a strong signal
     has_decoded_hit = any("[DECODED]" in f for f in findings)
+    has_include_hit = any(t in f for f in findings for t in ("[INCLUDE]", "[REMOTE]", "[INCLUDE+DECODED]"))
 
     if score < 7:
         return None
@@ -1263,7 +1264,7 @@ def _analyze_file_inner(path, root, _depth=0):
     if not has_code_signal and verify_status != "mismatch" and not disguise_bonus:
         return None
 
-    if score < 10 and not matched_sigs and not disguise_bonus and not has_decoded_hit and verify_status != "mismatch":
+    if score < 10 and not matched_sigs and not disguise_bonus and not has_decoded_hit and not has_include_hit and verify_status != "mismatch":
         return None
 
     # WordPress core / known libraries: suppress pure-heuristic noise
@@ -1279,7 +1280,7 @@ def _analyze_file_inner(path, root, _depth=0):
         if not strong:
             return None
 
-    strong_hit = has_decoded_hit or any(
+    strong_hit = has_decoded_hit or has_include_hit or any(
         s for s in matched_sigs
         if any(k in s.lower() for k in (
             "backdoor", "webshell", "eval($_", "command exec via user",
@@ -1323,24 +1324,51 @@ def _analyze_file_inner(path, root, _depth=0):
 # ---------------------------------------------------------------------------
 # Include / require / file_get_contents target following
 # ---------------------------------------------------------------------------
-# Matches: include 'x'; require_once("y"); file_get_contents('z');
-# Also: include( ABSPATH . 'file.php' ) is partially handled when a string literal path appears
+_INCLUDE_FUNCS = (
+    r"include|include_once|require|require_once|file_get_contents|readfile|"
+    r"fopen|file|parse_ini_file|highlight_file|show_source"
+)
+
+# Literal string or long base64-ish argument
 _INCLUDE_CALL_RE = re.compile(
-    r"""(?<!->)(?<!::)\b(?:include|include_once|require|require_once|file_get_contents|readfile|fopen|file|parse_ini_file|highlight_file|show_source)\s*\(\s*(?:['"]([^'"]{1,400})['"]|([A-Za-z0-9+/=]{40,}))""",
+    r"""(?<!->)(?<!::)\b(?:%s)\s*\(\s*(?:['"]([^'"]{1,500})['"]|([A-Za-z0-9+/=]{24,}))"""
+    % _INCLUDE_FUNCS,
     re.I,
 )
 
-# Paths that are normal WP includes — don't chase as suspicious
+# include($var) / require_once ( $foo )
+_INCLUDE_VAR_RE = re.compile(
+    r"""(?<!->)(?<!::)\b(?:%s)\s*\(\s*\$([a-zA-Z_][a-zA-Z0-9_]*)\s*\)"""
+    % _INCLUDE_FUNCS,
+    re.I,
+)
+
+# Simple assignments: $x = 'path'; $x = "path";
+_VAR_ASSIGN_STR_RE = re.compile(
+    r"""\$([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*['"]([^'"]{1,500})['"]""",
+    re.I,
+)
+
+# $x = base64_decode('...'); $x = gzinflate(base64_decode('...'));
+_VAR_ASSIGN_DECODE_RE = re.compile(
+    r"""\$([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|urldecode|rawurldecode)\s*\(\s*(?:base64_decode\s*\(\s*)?['"]([^'"]{8,})['"]""",
+    re.I,
+)
+
+# Paths that are normal WP includes — still resolved, but not treated as suspicious by themselves
 _BORING_INCLUDE_HINTS = (
     "wp-load.php", "wp-blog-header.php", "wp-config.php", "wp-settings.php",
     "wp-admin/", "wp-includes/", "ABSPATH", "WPINC", "template-loader",
 )
 
+MAX_REMOTE_SIZE = 1 * 1024 * 1024  # 1 MB
+REMOTE_TIMEOUT = 8  # seconds
+FOLLOW_REMOTE = True  # fetch http(s) include targets and scan body
+
 
 def _decode_possible_path(s):
     """Try to decode base64/hex/url-encoded path strings."""
     results = [s]
-    # base64
     raw = _safe_b64_decode(s)
     if raw:
         try:
@@ -1352,81 +1380,186 @@ def _decode_possible_path(s):
                 results.append(d.decode("utf-8", errors="ignore"))
             except Exception:
                 pass
-    # hex
     if re.fullmatch(r"(?:[0-9a-fA-F]{2}){4,}", s):
         try:
             results.append(bytes.fromhex(s).decode("utf-8", errors="ignore"))
         except Exception:
             pass
-    # urldecode
     try:
         u = unquote(s)
         if u != s:
             results.append(u)
     except Exception:
         pass
+    # rot13 on path-looking strings
+    try:
+        r13 = _rot13(s)
+        if r13 != s and ("/" in r13 or r13.endswith((".php", ".ico", ".txt", ".jpg"))):
+            results.append(r13)
+    except Exception:
+        pass
     return results
+
+
+def _build_var_map(text):
+    """Map $var -> list of possible string values (literal or decoded)."""
+    var_map = {}
+    if not text:
+        return var_map
+    for m in _VAR_ASSIGN_STR_RE.finditer(text):
+        var_map.setdefault(m.group(1), []).append(m.group(2))
+    for m in _VAR_ASSIGN_DECODE_RE.finditer(text):
+        name, payload = m.group(1), m.group(2)
+        for decoded in _decode_possible_path(payload):
+            # Also try treating payload itself as path after decode chain
+            var_map.setdefault(name, []).append(decoded)
+            if decoded != payload:
+                for d2 in _decode_possible_path(decoded):
+                    var_map.setdefault(name, []).append(d2)
+    return var_map
+
+
+def fetch_remote_url(url):
+    """
+    Fetch remote include target (http/https). Returns bytes or None.
+    Limited size/timeout to avoid hanging the scan.
+    """
+    if not FOLLOW_REMOTE:
+        return None
+    try:
+        if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
+            return None
+        req = Request(url, headers={"User-Agent": "wpbdscanner/1.3 (authorized security scan)"})
+        with urlopen(req, timeout=REMOTE_TIMEOUT) as resp:
+            data = resp.read(MAX_REMOTE_SIZE + 1)
+            if len(data) > MAX_REMOTE_SIZE:
+                data = data[:MAX_REMOTE_SIZE]
+            return data
+    except Exception:
+        return None
+
+
+def _resolve_local_path(s, base_dir, root, seen):
+    """Resolve a path string to an existing file under root. Returns Path or None."""
+    s = s.strip().strip("\x00")
+    if not s or len(s) > 500:
+        return None
+    if "\n" in s or "\r" in s:
+        s = s.split("\n", 1)[0].split("\r", 1)[0]
+    low = s.lower()
+    if low.startswith("http://") or low.startswith("https://") or low.startswith("php://"):
+        return None
+    for base in (base_dir, root):
+        try:
+            p = (base / s).resolve()
+        except Exception:
+            continue
+        try:
+            p.relative_to(root.resolve())
+        except Exception:
+            continue
+        if p.is_file():
+            key = str(p)
+            if key not in seen:
+                seen.add(key)
+                return p
+    return None
 
 
 def extract_include_targets(text, base_dir, root):
     """
-    Return list of existing Path objects referenced by include/require/
-    file_get_contents-style calls. Follows relative paths; tries light decoding.
+    Return (local_paths, remote_urls, notes).
+    local_paths: existing Path objects
+    remote_urls: http(s) strings to fetch
+    notes: human-readable hints (e.g. variable resolution)
     """
-    found = []
+    local = []
+    remote = []
+    notes = []
     seen = set()
     if not text:
-        return found
+        return local, remote, notes
     base_dir = Path(base_dir)
     root = Path(root)
+    var_map = _build_var_map(text)
 
-    for m in _INCLUDE_CALL_RE.finditer(text):
-        raw = m.group(1) or m.group(2) or ""
-        raw = raw.strip()
-        if not raw or len(raw) > 400:
-            continue
-        # Skip obvious core includes
+    def consider_string(raw, source="literal"):
+        raw = (raw or "").strip()
+        if not raw or len(raw) > 500:
+            return
         low = raw.lower()
         if any(h.lower() in low for h in _BORING_INCLUDE_HINTS):
-            continue
-        if low.startswith("http://") or low.startswith("https://") or low.startswith("php://"):
-            continue
-
-        candidates_str = _decode_possible_path(raw)
-        for s in candidates_str:
-            s = s.strip().strip("\x00")
-            if not s or len(s) > 400:
-                continue
-            # strip query-like junk
-            if "\n" in s or "\r" in s:
-                s = s.split("\n", 1)[0].split("\r", 1)[0]
-            # Resolve relative to including file, then root
-            for base in (base_dir, root):
-                try:
-                    p = (base / s).resolve()
-                except Exception:
-                    continue
-                try:
-                    # Must stay under scan root
-                    p.relative_to(root.resolve())
-                except Exception:
-                    continue
-                if not p.is_file():
-                    continue
-                key = str(p)
-                if key in seen:
-                    continue
-                seen.add(key)
-                found.append(p)
+            return
+        # Remote URL
+        if low.startswith("http://") or low.startswith("https://"):
+            if raw not in remote:
+                remote.append(raw)
+                notes.append("remote via %s: %s" % (source, raw[:80]))
+            return
+        if low.startswith("php://"):
+            notes.append("php:// stream via %s: %s" % (source, raw[:60]))
+            return
+        for s in _decode_possible_path(raw):
+            p = _resolve_local_path(s, base_dir, root, seen)
+            if p is not None:
+                local.append(p)
+                if source != "literal":
+                    notes.append("%s → %s" % (source, p.name))
                 break
-    return found
+
+    # 1) Literal string / base64 argument
+    for m in _INCLUDE_CALL_RE.finditer(text):
+        consider_string(m.group(1) or m.group(2) or "", "literal")
+
+    # 2) include($var) — resolve from assignments in the same file
+    for m in _INCLUDE_VAR_RE.finditer(text):
+        varname = m.group(1)
+        values = var_map.get(varname) or []
+        if not values:
+            notes.append("dynamic include($%s) — value not resolved in-file" % varname)
+            continue
+        for val in values[:6]:
+            consider_string(val, "$%s" % varname)
+
+    return local, remote, notes
+
+
+def _score_target_data(data, label):
+    """Quick score/findings for fetched or included raw bytes."""
+    score = 0
+    findings = []
+    snippets = []
+    if not data:
+        return 0, findings, snippets
+    if has_real_php_payload(data):
+        score += 12
+        findings.append("%s[INCLUDE]%s %s contains embedded PHP" % (C_RED, C_RESET, label))
+    try:
+        ttext = data.decode("utf-8", errors="ignore")
+    except Exception:
+        ttext = ""
+    if ttext:
+        for pattern, desc, weight in KNOWN_SIGNATURES:
+            if weight >= 8 and re.search(pattern, ttext, re.I | re.S):
+                score += weight
+                findings.append("%s[INCLUDE]%s %s → %s" % (C_RED, C_RESET, label, desc))
+                break
+        try:
+            for dh in try_selective_decode(ttext, max_candidates=3):
+                score += dh["score_boost"]
+                findings.append(
+                    "%s[INCLUDE+DECODED]%s %s via %s" % (C_RED, C_RESET, label, dh["method"])
+                )
+                snippets.append("include-decoded(%s): %s" % (dh["method"], dh["snippet"][:80]))
+        except Exception:
+            pass
+    return score, findings, snippets
 
 
 def inspect_include_targets(path, text, root, lib=False):
     """
-    Follow include/require/file_get_contents targets.
+    Follow include/require/file_get_contents targets (local, variable, remote).
     Returns (score_boost, findings, snippets, extra_results).
-    extra_results: list of full analyze_file dicts for suspicious targets.
     """
     score = 0
     findings = []
@@ -1435,11 +1568,19 @@ def inspect_include_targets(path, text, root, lib=False):
     if lib:
         return 0, findings, snippets, extra
 
-    targets = extract_include_targets(text, path.parent, root)
-    if not targets:
-        return 0, findings, snippets, extra
+    local_targets, remote_urls, notes = extract_include_targets(text, path.parent, root)
 
-    for t in targets[:12]:  # cap
+    for note in notes[:8]:
+        if "not resolved" in note:
+            score += 2
+            findings.append("%s[INCLUDE]%s %s" % (C_YELLOW, C_RESET, note))
+        elif note.startswith("remote") or note.startswith("php://"):
+            pass  # handled below
+        else:
+            snippets.append(note)
+
+    # --- Local targets ---
+    for t in local_targets[:15]:
         t_ext = t.suffix.lower()
         t_name = t.name.lower()
         t_str = str(t).replace("\\", "/").lower()
@@ -1449,22 +1590,15 @@ def inspect_include_targets(path, text, root, lib=False):
             and t_ext not in {".inc", ".module"}
         )
         in_uploads = any(p in t_str for p in FORBIDDEN_PHP_PATHS)
+        try:
+            rel = str(t.relative_to(root))
+        except Exception:
+            rel = t.name
 
-        # Suspicious: including a non-PHP file, or anything from uploads/cache
         if unusual or in_uploads:
             score += 6
-            findings.append(
-                "%s[INCLUDE]%s Loads suspicious path: %s"
-                % (C_RED, C_RESET, t.name if not unusual else str(t.relative_to(root)) if True else t.name)
-            )
-            try:
-                rel = str(t.relative_to(root))
-            except Exception:
-                rel = t.name
-            findings[-1] = "%s[INCLUDE]%s Loads suspicious path: %s" % (C_RED, C_RESET, rel)
+            findings.append("%s[INCLUDE]%s Loads suspicious path: %s" % (C_RED, C_RESET, rel))
             snippets.append("include → %s" % rel)
-
-            # Analyze the target itself
             try:
                 sub = analyze_file(t, root)
             except Exception:
@@ -1477,45 +1611,56 @@ def inspect_include_targets(path, text, root, lib=False):
                     % (C_RED, C_RESET, rel, sub.get("risk", "?"))
                 )
             else:
-                # Even if target is quiet, peek for PHP payload / high entropy
                 try:
                     data = safe_read(t)
-                    if data and has_real_php_payload(data):
-                        score += 10
-                        findings.append(
-                            "%s[INCLUDE]%s Target contains embedded PHP: %s"
-                            % (C_RED, C_RESET, rel)
-                        )
-                    elif data and not is_probably_binary(data):
-                        # selective decode on included non-php text
-                        try:
-                            ttext = data.decode("utf-8", errors="ignore")
-                            for dh in try_selective_decode(ttext, max_candidates=3):
-                                score += dh["score_boost"]
-                                findings.append(
-                                    "%s[INCLUDE+DECODED]%s %s via %s"
-                                    % (C_RED, C_RESET, rel, dh["method"])
-                                )
-                                snippets.append("include-decoded(%s): %s" % (dh["method"], dh["snippet"][:80]))
-                        except Exception:
-                            pass
+                    sc, fd, sn = _score_target_data(data, rel)
+                    score += sc
+                    findings.extend(fd)
+                    snippets.extend(sn)
                 except Exception:
                     pass
+        elif in_uploads:
+            score += 3
+            findings.append(
+                "%s[INCLUDE]%s Includes PHP from uploads/cache: %s" % (C_YELLOW, C_RESET, rel)
+            )
+            try:
+                sub = analyze_file(t, root)
+                if sub:
+                    extra.append(sub)
+            except Exception:
+                pass
+
+    # --- Remote URLs ---
+    for url in remote_urls[:5]:
+        score += 10  # loading remote code is always high-risk in WP context
+        findings.append("%s[REMOTE]%s Includes/fetches remote URL: %s" % (C_RED, C_RESET, url[:100]))
+        snippets.append("remote → %s" % url[:100])
+        data = fetch_remote_url(url)
+        if data:
+            sc, fd, sn = _score_target_data(data, "remote:" + url[:60])
+            score += sc
+            findings.extend(fd)
+            snippets.extend(sn)
+            if sc >= 8:
+                extra.append({
+                    "path": "REMOTE:" + url[:120],
+                    "full_path": url,
+                    "score": sc + 10,
+                    "risk": "CRITICAL" if sc >= 10 else "HIGH",
+                    "risk_color": C_BG_RED if sc >= 10 else C_RED,
+                    "findings": fd or ["%s[REMOTE]%s Remote body scored %d" % (C_RED, C_RESET, sc)],
+                    "snippets": sn[:4],
+                    "size": len(data),
+                    "entropy": round(entropy(data), 2),
+                    "mtime": "remote",
+                    "verified": None,
+                })
         else:
-            # Normal .php include — still analyze if under uploads
-            if in_uploads:
-                score += 3
-                try:
-                    rel = str(t.relative_to(root))
-                except Exception:
-                    rel = t.name
-                findings.append("%s[INCLUDE]%s Includes PHP from uploads/cache: %s" % (C_YELLOW, C_RESET, rel))
-                try:
-                    sub = analyze_file(t, root)
-                    if sub:
-                        extra.append(sub)
-                except Exception:
-                    pass
+            findings.append(
+                "%s[REMOTE]%s Could not fetch body (timeout/blocked/offline) — review URL manually: %s"
+                % (C_YELLOW, C_RESET, url[:80])
+            )
 
     return score, findings, snippets, extra
 
@@ -1538,11 +1683,16 @@ def _file_should_scan(path):
         return True
     if ext in PHP_EXTENSIONS or ext in DISGUISE_EXTENSIONS or ext in ARCHIVE_EXTENSIONS:
         return True
-    # Files with no extension (dropped shells, "shell", "x", etc.)
-    if INCLUDE_NO_EXTENSION and ext == "" and name and not name.startswith("."):
+    # Files with no extension — including hidden ones (.shell, .config, etc.)
+    # Attackers often hide payloads in dotfiles/dotdirs outside .git
+    if INCLUDE_NO_EXTENSION and ext == "" and name:
         return True
-    # Dotfiles that are config-like
+    # Known config dotfiles (also covered by DISGUISE / ALWAYS_SCAN)
     if name_lower in {".htaccess", ".user.ini", ".htpasswd"}:
+        return True
+    # Any hidden file with a tracked extension is already handled above;
+    # also pick up odd hidden names like ".php" (suffix may parse as empty on some systems)
+    if name.startswith(".") and name_lower.endswith((".php", ".phtml", ".phar", ".inc")):
         return True
     return False
 
@@ -1551,10 +1701,10 @@ def collect_files(root):
     candidates = []
     try:
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in {".git", "node_modules", ".svn", "__pycache__"}
-            ]
+            # Scan EVERY subdirectory under --dir, including .git, node_modules,
+            # .svn, __pycache__, and all other hidden folders. Attackers can
+            # drop shells anywhere they have write access — no path is "safe".
+            # Use --ignore if you deliberately want to exclude paths.
             for name in filenames:
                 p = Path(dirpath) / name
                 try:
@@ -1878,6 +2028,8 @@ Notes:
                         help="Ignore patterns file (substring or *.ext per line)")
     parser.add_argument("--yara", metavar="FILE",
                         help="Optional YARA rules file (requires yara-python)")
+    parser.add_argument("--no-remote", action="store_true",
+                        help="Do not fetch http(s) URLs found in include/file_get_contents")
     args = parser.parse_args()
 
     root = Path(args.dir).resolve()
@@ -1888,6 +2040,8 @@ Notes:
     threads = max(1, min(args.threads, 32))
     IGNORE_PATTERNS = load_ignore_patterns(args.ignore) if args.ignore else []
     YARA_RULES_PATH = args.yara
+    global FOLLOW_REMOTE
+    FOLLOW_REMOTE = not args.no_remote
 
     if args.yara:
         try:

