@@ -21,6 +21,7 @@ import time
 import zipfile
 import zlib
 import concurrent.futures
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -273,82 +274,136 @@ def safe_read(path, max_size=MAX_FILE_SIZE):
         return None
 
 
-def has_real_php_payload(content):
+# Strong PHP tokens that indicate a backdoor / probe (not doc examples like echo)
+_PHP_CODE_TOKENS = re.compile(
+    rb"(?:phpinfo|eval|assert|system|shell_exec|passthru|exec|popen|proc_open|"
+    rb"base64_decode|gzinflate|gzuncompress|preg_replace|create_function|"
+    rb"file_put_contents|fwrite|move_uploaded_file|"
+    rb"\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES))",
+    re.I
+)
+# Mild tokens OK for images/PDF (real PHP) but NOT enough for .js doc comments
+_PHP_MILD_TOKENS = re.compile(
+    rb"(?:echo|print|include|require|die\s*\(|exit\s*\()",
+    re.I
+)
+
+
+def _php_code_window(data, start_idx, max_len=120):
+    """
+    Extract a printable PHP code window after a tag, stopping at ?> or binary.
+    Handles EXIF/JPEG where binary follows immediately after ?>.
+    """
+    chunk = data[start_idx:start_idx + max_len]
+    # Stop at null or high binary bytes (common after EXIF strings)
+    out = bytearray()
+    for b in chunk:
+        if b == 0 or b > 126:
+            break
+        if b < 9 or (13 < b < 32):
+            break
+        out.append(b)
+        if len(out) >= 3 and out[-2:] == b"?>":
+            break
+    return bytes(out)
+
+
+def has_real_php_payload(content, require_strong=False):
     """
     Detect actual PHP inside non-PHP files (including EXIF/comment injection).
 
     Strict rules to avoid false positives on compressed image/PDF binary data
     that happens to contain the byte sequence <?= or <?php.
+
+    require_strong=True (for .js/.css docs): only accept PHP that looks like a
+    backdoor (eval/system/$_POST/phpinfo/...), not documentation examples
+    like <?php echo wp_customize_url(); ?>.
     """
     lower = content.lower()
 
     # --- <?php  (full open tag) ---
-    # Require whitespace, comment, or @ after the tag so random binary is ignored.
     start = 0
     while True:
         idx = lower.find(b"<?php", start)
         if idx < 0:
             break
-        after = lower[idx + 5: idx + 25]
+        # Window after the tag (skip "<?php")
+        after = lower[idx + 5: idx + 5 + 80]
         if not after:
             start = idx + 1
             continue
-        # Valid PHP: space/newline/tab, comment, or error-suppression
-        if after[0:1] in (b" ", b"\n", b"\r", b"\t", b"/", b"@", b"("):
-            # Extra safety: next bytes should be mostly printable
-            printable = sum(1 for b in after if 32 <= b < 127 or b in (9, 10, 13))
-            if printable >= len(after) * 0.80:
+
+        # Valid open: whitespace, comment, @, or (
+        if after[0:1] not in (b" ", b"\n", b"\r", b"\t", b"/", b"@", b"("):
+            if not (after.startswith(b"/*") or after.startswith(b"//")):
+                start = idx + 1
+                continue
+
+        # Code window stops at ?> or binary (critical for EXIF-injected PHP)
+        code = _php_code_window(lower, idx + 5, max_len=100)
+        if len(code) < 3:
+            start = idx + 1
+            continue
+
+        printable = sum(1 for b in code if 32 <= b < 127 or b in (9, 10, 13))
+        if printable < len(code) * 0.85:
+            start = idx + 1
+            continue
+
+        # Strong malware-oriented tokens vs mild (echo/print — common in JS docs)
+        strong = bool(_PHP_CODE_TOKENS.search(code))
+        mild = bool(_PHP_MILD_TOKENS.search(code)) or bool(
+            re.search(rb"[a-zA-Z_][a-zA-Z0-9_]*\s*\(", code)
+        )
+
+        if require_strong:
+            # .js/.css: only backdoor-style PHP, not <?php echo ... ?> docs
+            if strong:
                 return True
-        if after.startswith(b"/*") or after.startswith(b"//"):
-            return True
+        else:
+            # Images/PDF/EXIF: accept strong or mild real PHP statements
+            if strong or mild:
+                return True
+
         start = idx + 1
 
     # --- <?=  (short echo) ---
-    # Much stricter: must look like a real PHP expression, not random printable bytes.
-    # Real examples:  <?=$var?>  <?= $x ?>  <?=htmlspecialchars(...)?>  <?=1+2?>
+    # ONLY accept forms that look like real PHP short-echo, never random binary:
+    #   <?=$_GET['x']?>  <?=$var?>  <?=system('id')?>  <?=htmlspecialchars(...)?>
+    # Reject: <?=9{SDU...  <?=IGF!...  (JPEG/PDF entropy noise)
     start = 0
     while True:
         idx = lower.find(b"<?=", start)
         if idx < 0:
             break
-        after = lower[idx + 3: idx + 40]
-        if len(after) < 4:
+        code = _php_code_window(lower, idx + 3, max_len=80)
+        if len(code) < 3:
             start = idx + 1
             continue
-
-        # Strip leading whitespace for the syntax check
-        stripped = after.lstrip(b" \t\n\r")
+        stripped = code.lstrip(b" \t\n\r")
         if not stripped:
             start = idx + 1
             continue
 
-        # Must start with a plausible PHP expression token:
-        #   $var   function(   "string"  'string'  digit  (  [  true/false/null
-        first = stripped[0:1]
-        looks_like_php = False
-        if first == b"$":
-            # <?=$var or <?= $var
-            looks_like_php = True
-        elif first in (b'"', b"'", b"("):
-            looks_like_php = True
-        elif first.isdigit():
-            looks_like_php = True
-        elif first.isalpha() or first == b"_":
-            # function call or constant: htmlspecialchars, true, null, etc.
-            # require at least a few alphanumeric chars
-            ident = re.match(rb"[a-zA-Z_][a-zA-Z0-9_]*", stripped)
-            if ident and len(ident.group(0)) >= 2:
-                looks_like_php = True
+        printable = sum(1 for b in code if 32 <= b < 127 or b in (9, 10, 13))
+        if printable < len(code) * 0.90:
+            start = idx + 1
+            continue
 
-        if looks_like_php:
-            # Whole window must be overwhelmingly printable ASCII
-            printable = sum(1 for b in after if 32 <= b < 127 or b in (9, 10, 13))
-            if printable >= len(after) * 0.90:
-                # Reject if it still looks like binary garbage (high ratio of rare symbols)
-                # Real PHP short-echo rarely has long runs of symbols without letters
-                letters = sum(1 for b in after if (65 <= b <= 90) or (97 <= b <= 122) or b == 36)  # A-Z a-z $
-                if letters >= 3:
-                    return True
+        first = stripped[0:1]
+        # 1) Variable: <?=$foo?> or <?=$_GET[...]?>
+        if first == b"$":
+            # Must look like $ident ...
+            if re.match(rb"\$[a-zA-Z_][a-zA-Z0-9_]*", stripped):
+                return True
+        # 2) Known PHP function call: <?=system(...);?> / <?=phpinfo();?>
+        elif _PHP_CODE_TOKENS.search(stripped) or _PHP_MILD_TOKENS.search(stripped):
+            if re.search(rb"[a-zA-Z_][a-zA-Z0-9_]*\s*\(", stripped):
+                return True
+        # 3) Quoted string only if closed tag present (rare, still risky)
+        elif first in (b'"', b"'") and b"?>" in code:
+            return True
+        # Digits / random identifiers (<?=9{... <?=IGF!...) → ignore
 
         start = idx + 1
 
@@ -909,7 +964,26 @@ def inspect_archive(path, data):
 # ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
-def analyze_file(path, root):
+def analyze_file(path, root, _depth=0):
+    if _depth > 2:
+        return None
+    try:
+        path_key = str(path.resolve())
+    except Exception:
+        path_key = str(path)
+    with _ANALYZING_LOCK:
+        if path_key in _ANALYZING_PATHS:
+            return None
+        _ANALYZING_PATHS.add(path_key)
+
+    try:
+        return _analyze_file_inner(path, root, _depth)
+    finally:
+        with _ANALYZING_LOCK:
+            _ANALYZING_PATHS.discard(path_key)
+
+
+def _analyze_file_inner(path, root, _depth=0):
     try:
         rel = path.relative_to(root)
     except ValueError:
@@ -947,9 +1021,10 @@ def analyze_file(path, root):
         if not has_real_php_payload(data):
             return None
         disguise_bonus = 12
-    # Frontend assets (.js/.css/.map): only report if real PHP is embedded
+    # Frontend assets (.js/.css/.map): only report if *strong* PHP backdoor
+    # is embedded — not documentation examples like <?php echo wp_customize_url(); ?>
     elif is_frontend_asset:
-        if has_real_php_payload(data):
+        if has_real_php_payload(data, require_strong=True):
             disguise_bonus = 12
         else:
             return None
@@ -1064,6 +1139,23 @@ def analyze_file(path, root):
     if heur_hits:
         label = "lib-heuristics (reduced)" if lib else "HEUR"
         findings.append("%s[%s]%s %s" % (C_YELLOW, label, C_RESET, ", ".join(heur_hits)))
+
+    # 2b. Follow include/require/file_get_contents targets
+    if is_php_ext and text and not is_image:
+        try:
+            i_score, i_findings, i_snips, i_extra = inspect_include_targets(
+                path, text, root, lib=lib
+            )
+        except Exception:
+            i_score, i_findings, i_snips, i_extra = 0, [], [], []
+        if i_score:
+            score += i_score
+            has_code_signal = True
+            findings.extend(i_findings)
+            snippets.extend(i_snips[:4])
+        if i_extra:
+            with _DISCOVERED_LOCK:
+                _DISCOVERED_RESULTS.extend(i_extra)
 
     # 3. Location — only meaningful together with code signals
     is_forbidden_loc = any(p in path_str for p in FORBIDDEN_PHP_PATHS)
@@ -1229,6 +1321,206 @@ def analyze_file(path, root):
 
 
 # ---------------------------------------------------------------------------
+# Include / require / file_get_contents target following
+# ---------------------------------------------------------------------------
+# Matches: include 'x'; require_once("y"); file_get_contents('z');
+# Also: include( ABSPATH . 'file.php' ) is partially handled when a string literal path appears
+_INCLUDE_CALL_RE = re.compile(
+    r"""(?<!->)(?<!::)\b(?:include|include_once|require|require_once|file_get_contents|readfile|fopen|file|parse_ini_file|highlight_file|show_source)\s*\(\s*(?:['"]([^'"]{1,400})['"]|([A-Za-z0-9+/=]{40,}))""",
+    re.I,
+)
+
+# Paths that are normal WP includes — don't chase as suspicious
+_BORING_INCLUDE_HINTS = (
+    "wp-load.php", "wp-blog-header.php", "wp-config.php", "wp-settings.php",
+    "wp-admin/", "wp-includes/", "ABSPATH", "WPINC", "template-loader",
+)
+
+
+def _decode_possible_path(s):
+    """Try to decode base64/hex/url-encoded path strings."""
+    results = [s]
+    # base64
+    raw = _safe_b64_decode(s)
+    if raw:
+        try:
+            results.append(raw.decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+        for d in _try_zlib_variants(raw):
+            try:
+                results.append(d.decode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+    # hex
+    if re.fullmatch(r"(?:[0-9a-fA-F]{2}){4,}", s):
+        try:
+            results.append(bytes.fromhex(s).decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+    # urldecode
+    try:
+        u = unquote(s)
+        if u != s:
+            results.append(u)
+    except Exception:
+        pass
+    return results
+
+
+def extract_include_targets(text, base_dir, root):
+    """
+    Return list of existing Path objects referenced by include/require/
+    file_get_contents-style calls. Follows relative paths; tries light decoding.
+    """
+    found = []
+    seen = set()
+    if not text:
+        return found
+    base_dir = Path(base_dir)
+    root = Path(root)
+
+    for m in _INCLUDE_CALL_RE.finditer(text):
+        raw = m.group(1) or m.group(2) or ""
+        raw = raw.strip()
+        if not raw or len(raw) > 400:
+            continue
+        # Skip obvious core includes
+        low = raw.lower()
+        if any(h.lower() in low for h in _BORING_INCLUDE_HINTS):
+            continue
+        if low.startswith("http://") or low.startswith("https://") or low.startswith("php://"):
+            continue
+
+        candidates_str = _decode_possible_path(raw)
+        for s in candidates_str:
+            s = s.strip().strip("\x00")
+            if not s or len(s) > 400:
+                continue
+            # strip query-like junk
+            if "\n" in s or "\r" in s:
+                s = s.split("\n", 1)[0].split("\r", 1)[0]
+            # Resolve relative to including file, then root
+            for base in (base_dir, root):
+                try:
+                    p = (base / s).resolve()
+                except Exception:
+                    continue
+                try:
+                    # Must stay under scan root
+                    p.relative_to(root.resolve())
+                except Exception:
+                    continue
+                if not p.is_file():
+                    continue
+                key = str(p)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(p)
+                break
+    return found
+
+
+def inspect_include_targets(path, text, root, lib=False):
+    """
+    Follow include/require/file_get_contents targets.
+    Returns (score_boost, findings, snippets, extra_results).
+    extra_results: list of full analyze_file dicts for suspicious targets.
+    """
+    score = 0
+    findings = []
+    snippets = []
+    extra = []
+    if lib:
+        return 0, findings, snippets, extra
+
+    targets = extract_include_targets(text, path.parent, root)
+    if not targets:
+        return 0, findings, snippets, extra
+
+    for t in targets[:12]:  # cap
+        t_ext = t.suffix.lower()
+        t_name = t.name.lower()
+        t_str = str(t).replace("\\", "/").lower()
+        unusual = (
+            t_ext not in PHP_EXTENSIONS
+            and t_name not in ALWAYS_SCAN_NAMES
+            and t_ext not in {".inc", ".module"}
+        )
+        in_uploads = any(p in t_str for p in FORBIDDEN_PHP_PATHS)
+
+        # Suspicious: including a non-PHP file, or anything from uploads/cache
+        if unusual or in_uploads:
+            score += 6
+            findings.append(
+                "%s[INCLUDE]%s Loads suspicious path: %s"
+                % (C_RED, C_RESET, t.name if not unusual else str(t.relative_to(root)) if True else t.name)
+            )
+            try:
+                rel = str(t.relative_to(root))
+            except Exception:
+                rel = t.name
+            findings[-1] = "%s[INCLUDE]%s Loads suspicious path: %s" % (C_RED, C_RESET, rel)
+            snippets.append("include → %s" % rel)
+
+            # Analyze the target itself
+            try:
+                sub = analyze_file(t, root)
+            except Exception:
+                sub = None
+            if sub:
+                extra.append(sub)
+                score += 4
+                findings.append(
+                    "%s[INCLUDE]%s Target flagged: %s (%s)"
+                    % (C_RED, C_RESET, rel, sub.get("risk", "?"))
+                )
+            else:
+                # Even if target is quiet, peek for PHP payload / high entropy
+                try:
+                    data = safe_read(t)
+                    if data and has_real_php_payload(data):
+                        score += 10
+                        findings.append(
+                            "%s[INCLUDE]%s Target contains embedded PHP: %s"
+                            % (C_RED, C_RESET, rel)
+                        )
+                    elif data and not is_probably_binary(data):
+                        # selective decode on included non-php text
+                        try:
+                            ttext = data.decode("utf-8", errors="ignore")
+                            for dh in try_selective_decode(ttext, max_candidates=3):
+                                score += dh["score_boost"]
+                                findings.append(
+                                    "%s[INCLUDE+DECODED]%s %s via %s"
+                                    % (C_RED, C_RESET, rel, dh["method"])
+                                )
+                                snippets.append("include-decoded(%s): %s" % (dh["method"], dh["snippet"][:80]))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        else:
+            # Normal .php include — still analyze if under uploads
+            if in_uploads:
+                score += 3
+                try:
+                    rel = str(t.relative_to(root))
+                except Exception:
+                    rel = t.name
+                findings.append("%s[INCLUDE]%s Includes PHP from uploads/cache: %s" % (C_YELLOW, C_RESET, rel))
+                try:
+                    sub = analyze_file(t, root)
+                    if sub:
+                        extra.append(sub)
+                except Exception:
+                    pass
+
+    return score, findings, snippets, extra
+
+
+# ---------------------------------------------------------------------------
 # Scanner engine
 # ---------------------------------------------------------------------------
 def _file_should_scan(path):
@@ -1286,6 +1578,7 @@ def format_elapsed(seconds):
 
 
 def scan(root, threads):
+    global _DISCOVERED_RESULTS
     files = collect_files(root)
     total = len(files)
     print("%s[*] Found %d candidate files. Scanning with %d threads...%s\n" % (C_CYAN, total, threads, C_RESET))
@@ -1293,6 +1586,8 @@ def scan(root, threads):
     results = []
     processed = 0
     t0 = time.time()
+    with _DISCOVERED_LOCK:
+        _DISCOVERED_RESULTS = []
 
     def worker(path):
         return analyze_file(path, root)
@@ -1317,6 +1612,19 @@ def scan(root, threads):
                 continue
 
     print()
+    # Merge results from followed includes (dedupe by full_path)
+    with _DISCOVERED_LOCK:
+        extras = list(_DISCOVERED_RESULTS)
+        _DISCOVERED_RESULTS = []
+    seen_paths = {r["full_path"] for r in results}
+    for r in extras:
+        if r and r.get("full_path") not in seen_paths:
+            results.append(r)
+            seen_paths.add(r["full_path"])
+    if extras:
+        print("%s[*] Followed include/require targets: %d additional finding(s)%s"
+              % (C_CYAN, len([e for e in extras if e]), C_RESET))
+
     return sorted(results, key=lambda x: (-x["score"], x["path"])), time.time() - t0
 
 
@@ -1524,6 +1832,10 @@ def print_results(results, root, elapsed):
 # Runtime config set from CLI (used by collect_files / analyze_file)
 IGNORE_PATTERNS = []
 YARA_RULES_PATH = None
+_ANALYZING_PATHS = set()
+_ANALYZING_LOCK = threading.Lock()
+_DISCOVERED_RESULTS = []
+_DISCOVERED_LOCK = threading.Lock()
 
 
 def main():

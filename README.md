@@ -2,7 +2,7 @@
 
 Deep recursive scanner for **WordPress backdoors, PHP webshells, and malware**.
 
-Built for **low false positives** on real sites: WordPress core, popular plugins/themes, minified JS (Elementor, jQuery, Lottie, OceanWP), GlotPress `.l10n.php` files, and image binaries are filtered or dampened. Real threats still surface strongly — encoded shells, PHP-in-image, malicious `.htaccess`, archives containing PHP, and modified plugin files.
+Built for **low false positives** on real sites: WordPress core, popular plugins/themes, minified JS (Elementor, jQuery, Lottie, OceanWP), GlotPress `.l10n.php` files, and image/PDF binary noise are filtered or dampened. Real threats still surface strongly — encoded shells, PHP-in-image (including EXIF), malicious `.htaccess`, archives containing PHP, include-chains to disguised files, and modified plugin packages.
 
 ```bash
 python wpbdscanner.py --dir /path/to/wp-content --threads 8
@@ -19,14 +19,15 @@ python wpbdscanner.py -d ./wp-content --quarantine /tmp/wp-quarantine
 | Feature | Description |
 |---------|-------------|
 | **Strong signatures** | WSO, c99/r57, FilesMan, b374k, Alfa, WP-VCD, `eval(base64_decode)`, `eval($_POST)`, command-exec via user input, etc. |
-| **Weighted heuristics** | Reduced inside known library paths (`/wp-includes/`, `/vendor/`, TCPDF, phpseclib, …) |
+| **Weighted heuristics** | Reduced inside known library paths (`/wp-includes/`, `/vendor/`, TCPDF, phpseclib, Elementor, OceanWP, …) |
 | **Selective decoding** | Prefix-decode of base64 / gzip / rot13 / hex / urldecode; re-scan for malware markers (split payloads) |
-| **PHP-in-image** | Strict disguise detection for JPG/PNG/GIF/PDF (avoids binary `<?=` false positives) |
+| **PHP-in-image / EXIF** | Detects real PHP hidden in JPG/PNG/GIF/PDF (including EXIF comments); strict rules avoid binary `<?=` noise |
+| **Include chain following** | Tracks `include` / `require` / `file_get_contents` / `readfile` / `fopen` targets — including non-`.php` files and lightly encoded paths |
 | **Archive scan** | ZIP + TAR (gz/bz2/xz); inspects embedded PHP members |
 | **`.htaccess` / `.user.ini`** | `auto_prepend_file`, `AddHandler` PHP on assets, dangerous rewrites |
 | **Broad file coverage** | Rare PHP extensions, extension-less files, configs, HTML, archives |
 | **Plugin checksums** | SHA-256 vs wordpress.org; match → suppress, mismatch → elevate |
-| **Frontend asset filter** | `.js` / `.css` / `.map` only checked for **embedded PHP** (no RegExp.exec noise) |
+| **Frontend asset filter** | `.js` / `.css` / `.map` only flagged for **strong** embedded PHP backdoors (not doc examples like `<?php echo … ?>`) |
 | **Ignore list** | `--ignore patterns.txt` |
 | **JSON / CSV export** | `--json` / `--csv` for automation |
 | **Quarantine mode** | `--quarantine DIR` moves HIGH/CRITICAL aside safely |
@@ -87,6 +88,31 @@ python wpbdscanner.py -d ./wp-content --yara rules/example-webshells.yar
 
 ---
 
+## Include / require following
+
+Many backdoors use a small loader that pulls in a payload from a non-PHP path:
+
+```php
+<?php
+include("../../uploads/cache/x.ico");
+file_get_contents("../../uploads/cache/shell.jpg");
+include("Li4vLi4vdXBsb2Fkcy9...");  // base64-encoded path
+```
+
+The scanner:
+
+1. Parses `include`, `include_once`, `require`, `require_once`, `file_get_contents`, `readfile`, `fopen`, `file`, and similar calls
+2. Resolves relative paths under the scan root
+3. Attempts light decoding of path strings (base64, gzip+base64, hex, urldecode)
+4. Analyzes the target even when the extension is `.ico`, `.jpg`, no extension, etc.
+5. Raises the **parent** score and can list the **target** as its own finding
+
+Normal core includes (`wp-load.php`, `wp-includes/`, …) are skipped to limit noise.
+
+**Limits:** dynamic paths like `include($var)` with no string literal, remote `http://` URLs, and heavily built paths are not fully resolved.
+
+---
+
 ## Pair with WordPress CLI (recommended)
 
 This tool is filesystem-focused. For core/plugin integrity, also run:
@@ -98,23 +124,24 @@ wp plugin verify-checksums --all
 
 Typical incident workflow:
 
-1. `wp core verify-checksums` + plugin checksums
-2. `python wpbdscanner.py -d wp-content -t 8 --json report.json`
-3. Review CRITICAL/HIGH; quarantine or remove confirmed malware
+1. `wp core verify-checksums` + plugin checksums  
+2. `python wpbdscanner.py -d wp-content -t 8 --json report.json`  
+3. Review CRITICAL/HIGH; quarantine or remove confirmed malware  
 4. Rotate salts/keys, reset admin passwords, check users and `wp_options`
 
 ---
 
 ## What is scanned
 
-- **PHP:** `.php`, `.phtml`, `.php3`–`.php8`, `.pht`, `.php.bak`, `.php~`, …
-- **No extension:** dropped shells (`shell`, `x`, …)
-- **Disguise:** images, PDF, HTML, logs, configs (for embedded PHP)
-- **JS/CSS:** only if real PHP is embedded
-- **Archives:** `.zip`, `.tar`, `.gz`, `.tgz`, `.bz2`, `.xz`, `.rar`, `.7z`, …
-- **Always:** `.htaccess`, `.user.ini`, `wp-config.php`, …
+- **PHP:** `.php`, `.phtml`, `.php3`–`.php8`, `.pht`, `.php.bak`, `.php~`, …  
+- **No extension:** dropped shells (`shell`, `x`, …)  
+- **Disguise:** images, PDF, HTML, logs, configs (for embedded PHP / EXIF)  
+- **JS/CSS:** only if **strong** PHP backdoor is embedded (not documentation snippets)  
+- **Archives:** `.zip`, `.tar`, `.gz`, `.tgz`, `.bz2`, `.xz`, `.rar`, `.7z`, …  
+- **Always:** `.htaccess`, `.user.ini`, `wp-config.php`, …  
+- **Include targets:** files referenced by include/require/file_get_contents, even outside the usual extension list  
 
-Skipped: `.git`, `node_modules`, `.svn`, `__pycache__`, files > 8 MB.
+Skipped: `.git`, `node_modules`, `.svn`, `__pycache__`, files &gt; 8 MB.
 
 ---
 
@@ -131,7 +158,9 @@ Skipped: `.git`, `node_modules`, `.svn`, `__pycache__`, files > 8 MB.
 | `[SIG]` | High-confidence webshell / backdoor signature |
 | `[HEUR]` | Weighted heuristic |
 | `[DECODED]` | Malware markers after selective decode |
-| `[DISGUISE]` | Real PHP inside image/PDF/non-PHP |
+| `[DISGUISE]` | Real PHP inside image/PDF/non-PHP (incl. EXIF) |
+| `[INCLUDE]` | Suspicious include/require/file_get_contents target |
+| `[INCLUDE+DECODED]` | Decoded content from an included file |
 | `[ARCHIVE]` | Bad member inside ZIP/TAR |
 | `[HTACCESS]` | Dangerous server config directive |
 | `[YARA]` | Optional YARA rule match |
@@ -165,7 +194,7 @@ python -m py_compile wpbdscanner.py
 python tests/test_scanner.py
 ```
 
-Covers: classic shells, JS false-positive filter, PHP-in-JS, `.htaccess`, ZIP members, selective decode, binary image noise.
+Covers: classic shells, JS false-positive filter, PHP-in-JS, `.htaccess`, ZIP members, selective decode, binary image noise, EXIF-style payloads.
 
 ---
 
@@ -175,7 +204,8 @@ Covers: classic shells, JS false-positive filter, PHP-in-JS, `.htaccess`, ZIP me
 |------------|-----------|-------------|---------|---------------------------|
 | Webshell signatures | Strong | Varies | Varies | Strong |
 | Decode-then-rescan | Yes | Rare | Sometimes | Sometimes |
-| PHP in images (low FP) | Yes | Noisy | Varies | Yes |
+| PHP in images / EXIF (low FP) | Yes | Noisy | Varies | Yes |
+| Include-chain to non-PHP | Yes | Rare | Rare | Varies |
 | Archive members | ZIP/TAR | Rare | Varies | Varies |
 | Plugin.org checksums | Yes | No | No | Yes |
 | Minified JS noise | Filtered | Often poor | N/A | Better |
@@ -188,11 +218,12 @@ Covers: classic shells, JS false-positive filter, PHP-in-JS, `.htaccess`, ZIP me
 
 ## Limitations
 
-- Static analysis only (does not execute PHP).
-- Does not scan MySQL (`wp_options`, posts, etc.).
-- Premium plugins without public checksums cannot be hash-verified.
-- RAR/7z contents need extra libraries; suspicious names still noted.
-- Files > 8 MB skipped.
+- Static analysis only (does not execute PHP).  
+- Does not scan MySQL (`wp_options`, posts, etc.).  
+- Premium plugins without public checksums cannot be hash-verified.  
+- RAR/7z contents need extra libraries; suspicious names still noted.  
+- Files &gt; 8 MB skipped.  
+- Dynamic includes (`include($var)`) and remote URLs are not fully followed.  
 - Runtime-only / heavily split payloads may need manual review.
 
 ---
