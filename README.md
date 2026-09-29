@@ -39,7 +39,7 @@ python wpbdscanner.py -d ./wp-content --quarantine /tmp/wp-quarantine
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USER/wpbdscanner.git
+git clone https://github.com/pinoyvendetta/wpbdscanner.git
 cd wpbdscanner
 
 # Optional extras
